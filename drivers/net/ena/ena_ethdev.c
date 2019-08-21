@@ -201,6 +201,10 @@ static int ena_rx_queue_setup(struct rte_eth_dev *dev, uint16_t queue_idx,
 			      uint16_t nb_desc, unsigned int socket_id,
 			      const struct rte_eth_rxconf *rx_conf,
 			      struct rte_mempool *mp);
+static int ena_rx_queue_intr_enable(struct rte_eth_dev *dev,
+                                    uint16_t queue_idx);
+static int ena_rx_queue_intr_disable(struct rte_eth_dev *dev,
+                                     uint16_t queue_idx);
 static uint16_t eth_ena_recv_pkts(void *rx_queue,
 				  struct rte_mbuf **rx_pkts, uint16_t nb_pkts);
 static int ena_populate_rx_queue(struct ena_ring *rxq, unsigned int count);
@@ -254,6 +258,8 @@ static const struct eth_dev_ops ena_dev_ops = {
 	.dev_configure        = ena_dev_configure,
 	.dev_infos_get        = ena_infos_get,
 	.rx_queue_setup       = ena_rx_queue_setup,
+        .rx_queue_intr_enable = ena_rx_queue_intr_enable,
+        .rx_queue_intr_disable= ena_rx_queue_intr_disable,
 	.tx_queue_setup       = ena_tx_queue_setup,
 	.dev_start            = ena_start,
 	.dev_stop             = ena_stop,
@@ -1099,7 +1105,11 @@ static int ena_create_io_queue(struct ena_ring *ring)
 			ring->empty_rx_reqs[i] = i;
 	}
 	ctx.qid = ena_qid;
-	ctx.msix_vector = -1; /* interrupts not used */
+
+        if (ring->type == ENA_RING_TYPE_RX)
+		ctx.msix_vector = ring->id + 1;
+        else
+		ctx.msix_vector = -1; /* interrupts not used */
 	ctx.numa_node = ring->numa_socket_id;
 
 	rc = ena_com_create_io_queue(ena_dev, &ctx);
@@ -1671,11 +1681,81 @@ static int ena_calc_io_queue_num(struct ena_com_dev *ena_dev,
 	return io_queue_num;
 }
 
+static int ena_configure_intr(struct ena_adapter *adapter)
+{
+	struct rte_pci_device *pci_dev = adapter->pdev;
+	struct rte_intr_handle *intr_handle = &pci_dev->intr_handle;
+	struct ena_com_dev *ena_dev = &adapter->ena_dev;
+
+        if (rte_intr_cap_multiple(intr_handle)) {
+          unsigned num_ints = adapter->num_queues;
+
+          if (rte_intr_efd_enable(intr_handle, num_ints)) {
+            PMD_INIT_LOG(ERR, "Fail to create eventfd");
+            return -1;
+          }
+
+          if (!intr_handle->intr_vec) {
+                  intr_handle->intr_vec = rte_zmalloc("intr_vec",
+                      num_ints * sizeof(int), 0);
+                  if (!intr_handle->intr_vec) {
+                    PMD_INIT_LOG(ERR, "Failed to allocate %u rxq vectors", num_ints);
+                    return -ENOMEM;
+                  }
+          }
+
+          unsigned i;
+          for (i = 0; i < num_ints; i++) {
+            intr_handle->intr_vec[i] = RTE_INTR_VEC_RXTX_OFFSET + i;
+          }
+        } else {
+            PMD_INIT_LOG(ERR, "Multiple intr vector not supported");
+        }
+
+
+	rte_intr_callback_register(intr_handle,
+				   ena_interrupt_handler_rte,
+				   adapter);
+	rte_intr_enable(intr_handle);
+	ena_com_set_admin_polling_mode(ena_dev, false);
+
+        return 0;
+}
+
+static int ena_int_status(struct rte_eth_dev *dev,
+                          uint16_t queue_idx,
+                          bool status)
+{
+	struct ena_adapter *adapter = dev->data->dev_private;
+	struct ena_com_dev *ena_dev = &adapter->ena_dev;
+	struct ena_eth_io_intr_reg intr_reg;
+	struct ena_ring *rx_ring = &adapter->rx_ring[queue_idx];
+
+	ena_com_update_intr_reg(&intr_reg,
+            ena_com_get_nonadaptive_moderation_interval_rx(ena_dev),
+            ena_com_get_nonadaptive_moderation_interval_tx(ena_dev),
+            status);
+
+	ena_com_unmask_intr(rx_ring->ena_com_io_cq, &intr_reg);
+        return 0;
+}
+
+static int ena_rx_queue_intr_enable(struct rte_eth_dev *dev,
+                                    uint16_t queue_idx)
+{
+        return ena_int_status(dev, queue_idx, 1);
+}
+
+static int ena_rx_queue_intr_disable(struct rte_eth_dev *dev,
+                                     uint16_t queue_idx)
+{
+        return ena_int_status(dev, queue_idx, 0);
+}
+
 static int eth_ena_dev_init(struct rte_eth_dev *eth_dev)
 {
 	struct ena_calc_queue_size_ctx calc_queue_ctx = { 0 };
 	struct rte_pci_device *pci_dev;
-	struct rte_intr_handle *intr_handle;
 	struct ena_adapter *adapter = eth_dev->data->dev_private;
 	struct ena_com_dev *ena_dev = &adapter->ena_dev;
 	struct ena_com_dev_get_features_ctx get_feat_ctx;
@@ -1709,7 +1789,6 @@ static int eth_ena_dev_init(struct rte_eth_dev *eth_dev)
 		     pci_dev->addr.devid,
 		     pci_dev->addr.function);
 
-	intr_handle = &pci_dev->intr_handle;
 
 	adapter->regs = pci_dev->mem_resource[ENA_REGS_BAR].addr;
 	adapter->dev_mem_base = pci_dev->mem_resource[ENA_MEM_BAR].addr;
@@ -1805,11 +1884,9 @@ static int eth_ena_dev_init(struct rte_eth_dev *eth_dev)
 		goto err_delete_debug_area;
 	}
 
-	rte_intr_callback_register(intr_handle,
-				   ena_interrupt_handler_rte,
-				   adapter);
-	rte_intr_enable(intr_handle);
-	ena_com_set_admin_polling_mode(ena_dev, false);
+        if ((rc = ena_configure_intr(adapter))) {
+          goto err_delete_stats;
+        }
 	ena_com_admin_aenq_enable(ena_dev);
 
 	if (adapters_found == 0)
@@ -1821,6 +1898,9 @@ static int eth_ena_dev_init(struct rte_eth_dev *eth_dev)
 
 	return 0;
 
+err_delete_stats:
+        rte_free(adapter->drv_stats);
+        adapter->drv_stats = NULL;
 err_delete_debug_area:
 	ena_com_delete_debug_area(ena_dev);
 
